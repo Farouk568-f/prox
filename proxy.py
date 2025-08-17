@@ -1,10 +1,10 @@
-from flask import Flask, request, Response, stream_with_context, abort
+from flask import Flask, request, Response, stream_with_context
 import requests
 from urllib.parse import urlparse
 
 app = Flask(__name__)
 
-# اختياري: قوائم سماح لحماية البروكسي (اشطب السطور 12-16 إذا ما تبغى تقييد الدومين)
+# يمكن تغييرها لقائمة فارغة للسماح للجميع
 ALLOWED_HOSTS = {"valiw.hakunaymatata.com"}
 
 @app.route("/proxy", methods=["GET", "HEAD"])
@@ -19,32 +19,32 @@ def proxy():
     if ALLOWED_HOSTS and p.hostname not in ALLOWED_HOSTS:
         return "الدومين غير مسموح", 403
 
-    # مرّر الهيدرز المهمة كما هي
+    # الهيدرز المرسلة للسيرفر الأصلي
     fwd_headers = {}
     for h in ["User-Agent", "Accept", "Accept-Language", "Range", "Cookie"]:
         v = request.headers.get(h)
         if v:
             fwd_headers[h] = v
 
-    # مهم جداً ليدعم الـ byte-range
-    fwd_headers["Accept-Encoding"] = "identity"
+    fwd_headers["Accept-Encoding"] = "identity"  # منع الضغط لتسريع الستريم
 
-    # بعض السيرفرات تتطلب Referer/Origin
+    # بعض السيرفرات تحتاج هذه الهيدرز
     fwd_headers.setdefault("Referer", "https://fmoviesunblocked.net/")
     fwd_headers.setdefault("Origin", "https://fmoviesunblocked.net")
 
-    method = request.method
-    upstream = requests.request(
-        method,
-        target_url,
-        headers=fwd_headers,
-        stream=True,
-        allow_redirects=True,
-        timeout=30,
-    )
+    try:
+        upstream = requests.request(
+            request.method,
+            target_url,
+            headers=fwd_headers,
+            stream=True,
+            allow_redirects=True,
+            timeout=15,
+        )
+    except requests.exceptions.RequestException as e:
+        return f"فشل الاتصال بالسيرفر: {e}", 502
 
-    # ننسخ الهيدرز الأساسية التي يحتاجها مشغل الفيديو
-    resp_headers = {}
+    # الهيدرز المهمة فقط
     hop_by_hop = {"connection", "transfer-encoding", "content-encoding"}
     keep_headers = {
         "Content-Type",
@@ -54,24 +54,21 @@ def proxy():
         "Content-Disposition",
         "ETag",
         "Last-Modified",
-        "Cache-Control",
-        "Expires",
     }
-    for k, v in upstream.headers.items():
-        if k.lower() in hop_by_hop:
-            continue
-        if k in keep_headers:
-            resp_headers[k] = v
+    resp_headers = {
+        k: v for k, v in upstream.headers.items()
+        if k in keep_headers and k.lower() not in hop_by_hop
+    }
 
-    # تسهيل تشغيله من صفحات محلية/سيرفر آخر
+    # كروس دومين + كاش مؤقت
     resp_headers["Access-Control-Allow-Origin"] = "*"
+    resp_headers["Cache-Control"] = "public, max-age=3600"  # ساعة
 
-    if method == "HEAD":
-        # بدون جسم، فقط هيدرز وحالة
+    if request.method == "HEAD":
         return Response(status=upstream.status_code, headers=resp_headers)
 
     def generate():
-        for chunk in upstream.iter_content(chunk_size=64 * 1024):
+        for chunk in upstream.iter_content(chunk_size=128 * 1024):
             if chunk:
                 yield chunk
 
@@ -86,8 +83,5 @@ def proxy():
 def health():
     return "ok"
 
-# Vercel يتطلب هذا المتغير
-app.debug = False
-
 if __name__ == "__main__":
-    app.run(port=5000)
+    app.run(port=5000, threaded=True)
