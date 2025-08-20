@@ -1,87 +1,124 @@
+# main.py أو proxy.py
+
 from flask import Flask, request, Response, stream_with_context
 import requests
 from urllib.parse import urlparse
 
 app = Flask(__name__)
 
-# يمكن تغييرها لقائمة فارغة للسماح للجميع
-ALLOWED_HOSTS = {"valiw.hakunaymatata.com"}
+# --- الإعدادات ---
+# استخدم هذا الخيار للسماح بكل النطاقات الفرعية لنطاق معين.
+# هذا هو الخيار الموصى به لحالتك.
+ALLOWED_SUFFIXES = (".hakunaymatata.com",) 
 
-@app.route("/proxy", methods=["GET", "HEAD"])
+# أو يمكنك استخدام قائمة محددة إذا أردت تقييدًا أكثر
+# ALLOWED_HOSTS = {"valiw.hakunaymatata.com", "bcdnw.hakunaymatata.com", "cacdn.hakunaymatata.com"}
+
+# -----------------
+
+@app.route("/proxy", methods=["GET", "HEAD", "OPTIONS"])
 def proxy():
+    # 1. التعامل مع طلبات CORS Preflight أولاً
+    if request.method == "OPTIONS":
+        # يرسل المتصفح هذا الطلب للتحقق من الأذونات قبل إرسال الطلب الفعلي
+        resp = Response(status=204) # 204 No Content
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Range, User-Agent, Accept, Accept-Language, Cookie"
+        resp.headers["Access-Control-Max-Age"] = "86400" # السماح بالكاش لمدة يوم
+        return resp
+
+    # 2. التحقق من باراميتر الرابط
     target_url = request.args.get("url")
     if not target_url:
-        return "أرسل باراميتر ?url=", 400
+        return "Please provide a ?url= parameter.", 400
 
-    p = urlparse(target_url)
-    if p.scheme not in ("http", "https"):
-        return "رابط غير صالح", 400
-    if ALLOWED_HOSTS and p.hostname not in ALLOWED_HOSTS:
-        return "الدومين غير مسموح", 403
+    try:
+        p = urlparse(target_url)
+        if p.scheme not in ("http", "https"):
+            return "Invalid URL scheme.", 400
+    except ValueError:
+        return "Invalid URL format.", 400
+    
+    # 3. التحقق من النطاق المسموح به (Host/Domain)
+    is_allowed = False
+    if 'ALLOWED_SUFFIXES' in globals():
+        # التحقق إذا كان النطاق ينتهي بأحد اللواحق المسموحة
+        if any(p.hostname and p.hostname.endswith(s) for s in ALLOWED_SUFFIXES):
+            is_allowed = True
+    elif 'ALLOWED_HOSTS' in globals() and ALLOWED_HOSTS:
+        # التحقق إذا كان النطاق موجودًا في القائمة المسموحة
+        if p.hostname in ALLOWED_HOSTS:
+            is_allowed = True
+    else: # إذا كانت القوائم فارغة، اسمح للجميع
+        is_allowed = True
 
-    # الهيدرز المرسلة للسيرفر الأصلي
+    if not is_allowed:
+        return "Host is not allowed.", 403
+
+    # 4. تجميع الهيدرز لإرسالها للسيرفر الأصلي
     fwd_headers = {}
-    for h in ["User-Agent", "Accept", "Accept-Language", "Range", "Cookie"]:
+    # تمرير الهيدرز الأساسية من العميل
+    for h in ["User-Agent", "Accept", "Accept-Language", "Range", "Cookie", "Referer", "Origin"]:
         v = request.headers.get(h)
         if v:
             fwd_headers[h] = v
+    
+    # منع الضغط لضمان عمل الستريم والـ Range requests بشكل صحيح
+    fwd_headers["Accept-Encoding"] = "identity"
 
-    fwd_headers["Accept-Encoding"] = "identity"  # منع الضغط لتسريع الستريم
-
-    # بعض السيرفرات تحتاج هذه الهيدرز
-    fwd_headers.setdefault("Referer", "https://fmoviesunblocked.net/")
-    fwd_headers.setdefault("Origin", "https://fmoviesunblocked.net")
-
+    # 5. إرسال الطلب للسيرفر الأصلي (Upstream)
     try:
-        upstream = requests.request(
+        upstream_response = requests.request(
             request.method,
             target_url,
             headers=fwd_headers,
-            stream=True,
+            stream=True,         # مهم جداً للبث (streaming)
             allow_redirects=True,
-            timeout=15,
+            timeout=(5, 30),     # (timeout للاتصال, timeout للقراءة)
         )
     except requests.exceptions.RequestException as e:
-        return f"فشل الاتصال بالسيرفر: {e}", 502
+        return f"Upstream server request failed: {e}", 502
 
-    # الهيدرز المهمة فقط
-    hop_by_hop = {"connection", "transfer-encoding", "content-encoding"}
-    keep_headers = {
-        "Content-Type",
-        "Content-Length",
-        "Accept-Ranges",
-        "Content-Range",
-        "Content-Disposition",
-        "ETag",
-        "Last-Modified",
-    }
-    resp_headers = {
-        k: v for k, v in upstream.headers.items()
-        if k in keep_headers and k.lower() not in hop_by_hop
-    }
+    # 6. بناء هيدرز الرد لإرسالها للعميل
+    resp_headers = {}
+    # قائمة الهيدرز المهمة التي يجب تمريرها للعميل (خاصة للفيديو)
+    keep_headers = [
+        "Content-Type", "Content-Length", "Accept-Ranges", "Content-Range",
+        "Content-Disposition", "ETag", "Last-Modified",
+    ]
+    for k, v in upstream_response.headers.items():
+        if k in keep_headers:
+            resp_headers[k] = v
 
-    # كروس دومين + كاش مؤقت
+    # إضافة هيدرز CORS للسماح بالوصول من أي نطاق
     resp_headers["Access-Control-Allow-Origin"] = "*"
-    resp_headers["Cache-Control"] = "public, max-age=3600"  # ساعة
+    # السماح للمتصفح بالوصول لهيدرز مهمة مثل Content-Range
+    resp_headers["Access-Control-Expose-Headers"] = "Content-Type, Content-Length, Accept-Ranges, Content-Range"
+    resp_headers["Cache-Control"] = "public, max-age=3600" # كاش لمدة ساعة
 
+    # 7. إذا كان الطلب HEAD، أرجع الهيدرز فقط بدون محتوى
     if request.method == "HEAD":
-        return Response(status=upstream.status_code, headers=resp_headers)
+        return Response(status=upstream_response.status_code, headers=resp_headers)
 
+    # 8. بث المحتوى للعميل (Streaming)
     def generate():
-        for chunk in upstream.iter_content(chunk_size=128 * 1024):
+        # استخدام حجم chunk مناسب للفيديو
+        for chunk in upstream_response.iter_content(chunk_size=128 * 1024):
             if chunk:
                 yield chunk
 
     return Response(
         stream_with_context(generate()),
-        status=upstream.status_code,
+        status=upstream_response.status_code,
         headers=resp_headers,
-        direct_passthrough=True,
     )
 
+@app.route("/")
 @app.route("/health")
-def health():
-    return "ok"
+def health_check():
+    return "Proxy is running.", 200
 
 if __name__ == "__main__":
-    app.run(port=5000, threaded=True)
+    # هذا للتشغيل المحلي فقط (للتجربة)
+    app.run(host="0.0.0.0", port=5000, threaded=True)
