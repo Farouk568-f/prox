@@ -1,3 +1,4 @@
+# .gitignore
 __pycache__/
 *.pyc
 *.pyo
@@ -7,4 +8,7 @@ env/
 venv/
 .venv/
 .env
+
+# تجاهل ملفات المنصات الأخرى
 .vercel
+fly.toml
