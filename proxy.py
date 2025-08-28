@@ -1,5 +1,3 @@
-# proxy.py
-
 from flask import Flask, request, Response, stream_with_context
 import requests
 from urllib.parse import urlparse
@@ -7,8 +5,9 @@ from urllib.parse import urlparse
 app = Flask(__name__)
 
 # --- الإعدادات ---
-# السماح لجميع النطاقات الفرعية لـ hakunaymatata.com
 ALLOWED_SUFFIXES = (".hakunaymatata.com",)
+CHUNK_SIZE = 256 * 1024  # 256KB
+SESSION = requests.Session()  # إعادة استخدام الـ TCP connections لسرعة أكبر
 # -----------------
 
 @app.route("/proxy", methods=["GET", "HEAD", "OPTIONS"])
@@ -40,36 +39,31 @@ def proxy():
     if not is_allowed:
         return "Host is not allowed.", 403
 
-    # 4. تجميع الهيدرز لإرسالها للسيرفر الأصلي
-    # نسخ هيدرز العميل (مثل User-Agent و Range)
+    # Forward headers
     fwd_headers = {k: v for k, v in request.headers.items()}
     fwd_headers.pop("Host", None)
 
-    # --- التعديل الحاسم هنا ---
-    # فرض هيدرز ثابتة لخداع حماية الهوتلينك لدى الخادم الأصلي
-    # هذه هي القيم التي يتوقعها السيرفر ليعتبر الطلب شرعياً.
+    # Fix hotlink protection
     fwd_headers["Referer"] = "https://fmoviesunblocked.net/"
     fwd_headers["Origin"] = "https://fmoviesunblocked.net"
-    # --------------------------
 
-    # إجبار السيرفر على عدم ضغط المحتوى لضمان عمل الـ streaming
+    # Force no compression for proper streaming
     fwd_headers["Accept-Encoding"] = "identity"
 
     try:
-        upstream_response = requests.request(
+        upstream_response = SESSION.request(
             request.method,
             target_url,
             headers=fwd_headers,
             stream=True,
-            allow_redirects=True,
-            timeout=(5, 30),
+            allow_redirects=True
         )
     except requests.exceptions.RequestException as e:
         return f"Upstream server request failed: {e}", 502
 
     hop_by_hop_headers = {
-        "Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
-        "TE", "Trailers", "Transfer-Encoding", "Content-Encoding"
+        "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+        "te", "trailers", "transfer-encoding", "content-encoding"
     }
     
     resp_headers = {
@@ -84,7 +78,7 @@ def proxy():
         return Response(status=upstream_response.status_code, headers=resp_headers)
 
     def generate():
-        for chunk in upstream_response.iter_content(chunk_size=128 * 1024):
+        for chunk in upstream_response.iter_content(chunk_size=CHUNK_SIZE):
             if chunk:
                 yield chunk
 
@@ -100,4 +94,5 @@ def health_check():
     return "Proxy is running.", 200
 
 if __name__ == "__main__":
+    # ينصح باستخدام gunicorn للإنتاج بدلاً من run العادي
     app.run(host="0.0.0.0", port=5000, threaded=True)
